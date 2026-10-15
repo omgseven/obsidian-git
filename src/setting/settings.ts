@@ -12,6 +12,7 @@ import {
     SecretComponent,
     Setting,
     SettingPage,
+    setTooltip,
 } from "obsidian";
 import {
     DATE_TIME_FORMAT_SECONDS,
@@ -19,6 +20,11 @@ import {
     GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH,
 } from "src/constants";
 import { IsomorphicGit } from "src/gitManager/isomorphicGit";
+import {
+    buildGitxEnv,
+    checkGitxInstallation,
+    resolveGitxExecutable,
+} from "src/gitManager/gitx";
 import { SimpleGit } from "src/gitManager/simpleGit";
 import { previewColor } from "src/editor/lineAuthor/lineAuthorProvider";
 import type {
@@ -740,6 +746,127 @@ export class ObsidianGitSettingsTab extends PluginSettingTab {
                                         void this.plugin.changeGitPath(value);
                                     })
                             );
+                        },
+                    },
+                    {
+                        name: "Enable gitx push",
+                        desc: "Push through gitx instead of the Git binary. This avoids environments that intercept 'git push'. Requires a working gitx installation on this device.",
+                        visible: desktop,
+                        render: (setting) => {
+                            setting.addToggle((toggle) =>
+                                toggle
+                                    .setValue(
+                                        this.plugin.localStorage.getGitxEnabled()
+                                    )
+                                    .onChange((value) => {
+                                        this.plugin.localStorage.setGitxEnabled(
+                                            value
+                                        );
+                                    })
+                            );
+                        },
+                    },
+                    {
+                        name: "Gitx push executable",
+                        desc: "Path to the gitx executable. Leave empty to auto-detect it.",
+                        visible: desktop,
+                        render: (setting) => {
+                            setting.addText((text) =>
+                                text
+                                    .setPlaceholder("~/.local/bin/gitx")
+                                    .setValue(
+                                        this.plugin.localStorage.getGitxPath() ??
+                                            ""
+                                    )
+                                    .onChange((value) => {
+                                        this.plugin.localStorage.setGitxPath(
+                                            value
+                                        );
+                                    })
+                            );
+                        },
+                    },
+                    {
+                        name: "Gitx installation status",
+                        desc: "Checks that the gitx executable can be started.",
+                        visible: desktop,
+                        render: (setting) => {
+                            const installCommand =
+                                "curl -fsSL https://raw.githubusercontent.com/omgseven/gitx/main/install.sh | sh";
+                            const statusEl = setting.controlEl.createDiv({
+                                cls: "obsidian-git-gitx-status",
+                            });
+                            const dotEl = statusEl.createSpan({
+                                cls: "obsidian-git-gitx-status-dot",
+                            });
+                            const textEl = statusEl.createSpan();
+                            const copyEl = setting.controlEl.createEl(
+                                "button",
+                                {
+                                    cls: "obsidian-git-gitx-copy",
+                                    text: "Copy install cmd",
+                                }
+                            );
+                            copyEl.hide();
+                            copyEl.onClickEvent(() => {
+                                void navigator.clipboard
+                                    .writeText(installCommand)
+                                    .then(
+                                        () =>
+                                            new Notice(
+                                                "Install command copied."
+                                            )
+                                    )
+                                    .catch(
+                                        () =>
+                                            new Notice(
+                                                "Could not copy the install command."
+                                            )
+                                    );
+                            });
+                            const setStatus = (
+                                state: "checking" | "ok" | "error",
+                                text: string,
+                                tooltip: string
+                            ) => {
+                                dotEl.removeClass("mod-ok", "mod-error");
+                                if (state == "ok") dotEl.addClass("mod-ok");
+                                if (state == "error")
+                                    dotEl.addClass("mod-error");
+                                textEl.setText(text);
+                                if (state == "error") copyEl.show();
+                                else copyEl.hide();
+                                setTooltip(statusEl, tooltip);
+                            };
+                            const check = () => {
+                                setStatus(
+                                    "checking",
+                                    "Checking...",
+                                    "Click to check again."
+                                );
+                                const executable = resolveGitxExecutable(
+                                    this.plugin.localStorage.getGitxPath()
+                                );
+                                const env = buildGitxEnv(
+                                    this.plugin.localStorage.getPATHPaths()
+                                );
+                                void checkGitxInstallation(
+                                    executable,
+                                    env
+                                ).then((status) => {
+                                    setStatus(
+                                        status.installed ? "ok" : "error",
+                                        status.installed
+                                            ? status.details
+                                            : "Not installed",
+                                        status.installed
+                                            ? "Click to check again."
+                                            : `${status.details}\nClick to check again.`
+                                    );
+                                });
+                            };
+                            statusEl.onClickEvent(check);
+                            check();
                         },
                     },
                     {

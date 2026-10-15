@@ -30,6 +30,7 @@ import { GitConflictError, GitOperation, NoNetworkError } from "../types";
 import { impossibleBranch, spawnAsync, splitRemoteBranch } from "../utils";
 import { AskpassServer } from "./askpassServer";
 import { GitManager } from "./gitManager";
+import { buildGitxEnv, resolveGitxExecutable, runGitx } from "./gitx";
 
 export class SimpleGit extends GitManager {
     git!: simple.SimpleGit;
@@ -909,8 +910,13 @@ export class SimpleGit extends GitManager {
                 }
 
                 const pushTarget = await this.getPushTarget(currentBranch);
+                const gitxPath = this.getGitxPath();
 
-                if (!pushTarget && this.plugin.settings.updateSubmodules) {
+                if (
+                    !pushTarget &&
+                    gitxPath == undefined &&
+                    this.plugin.settings.updateSubmodules
+                ) {
                     this.plugin.log(
                         "No push target found. Ignoring push of main repo and updating submodules only."
                     );
@@ -927,7 +933,13 @@ export class SimpleGit extends GitManager {
                     ).changed;
                 }
 
-                await this.git.push();
+                if (gitxPath != undefined) {
+                    // Transfer through gitx so the push does not execute the
+                    // git binary, which some environments intercept.
+                    await this.pushViaGitx(gitxPath, currentBranch, pushTarget);
+                } else {
+                    await this.git.push();
+                }
 
                 return remoteChangedFiles === 0
                     ? { status: "up-to-date" }
@@ -936,6 +948,106 @@ export class SimpleGit extends GitManager {
                 this.convertErrors(e);
             }
         });
+    }
+
+    private getGitxPath(): string | undefined {
+        if (!this.plugin.localStorage.getGitxEnabled()) {
+            return undefined;
+        }
+        return resolveGitxExecutable(this.plugin.localStorage.getGitxPath());
+    }
+
+    /**
+     * Pushes the current branch through the gitx CLI. gitx updates the
+     * remote branch that carries the name of the current branch, so renamed
+     * push targets are rejected instead of being pushed to the wrong branch.
+     * Without a configured push target the single remote is used, which keeps
+     * repositories without an upstream branch working.
+     */
+    private async pushViaGitx(
+        gitxPath: string,
+        currentBranch: string,
+        pushTarget: { ref: string; exists: boolean } | undefined
+    ): Promise<void> {
+        const remotePrefix = "refs/remotes/";
+        let remote: string | undefined;
+        if (pushTarget != undefined) {
+            if (!pushTarget.ref.startsWith(remotePrefix)) {
+                throw new Error(
+                    `Cannot push with gitx: the push target '${pushTarget.ref}' is not a remote branch.`
+                );
+            }
+            const [remoteName, branch] = splitRemoteBranch(
+                pushTarget.ref.substring(remotePrefix.length)
+            );
+            if (remoteName.length === 0 || branch == undefined) {
+                throw new Error(
+                    `Cannot push with gitx: the push target '${pushTarget.ref}' is not a remote branch.`
+                );
+            }
+            if (branch !== currentBranch) {
+                throw new Error(
+                    `Cannot push with gitx: the push target '${remoteName}/${branch}' differs from the current branch '${currentBranch}'. gitx pushes to the branch with the same name.`
+                );
+            }
+            remote = remoteName;
+        } else {
+            // No upstream is configured. Fall back to the single remote, if
+            // there is one, because gitx pushes the current branch to the
+            // branch of the same name.
+            const remotes = await this.getRemotes();
+            if (remotes.length === 1) {
+                remote = remotes[0];
+            }
+        }
+        if (remote == undefined) {
+            throw new Error(
+                `Cannot push with gitx: no push target could be determined for branch '${currentBranch}'.`
+            );
+        }
+        await this.runGitxPush(gitxPath, remote);
+    }
+
+    /**
+     * Runs `gitx push <remote>` and maps the result onto the plugin's error
+     * types. Shared by the regular push path and the fallback that creates a
+     * remote branch before setting a new upstream.
+     */
+    private async runGitxPush(gitxPath: string, remote: string): Promise<void> {
+        const result = await runGitx(gitxPath, ["push", remote], {
+            cwd: this.absoluteRepoPath,
+            env: buildGitxEnv(this.plugin.localStorage.getPATHPaths()),
+        });
+        if (result.error != undefined) {
+            throw new Error(
+                `Could not run '${gitxPath}': ${result.error.message}. Check the "Gitx push executable" setting.`
+            );
+        }
+        if (result.code !== 0) {
+            const message = `${result.stderr}${result.stdout}`
+                .trim()
+                .replace(/^gitx: error: /, "");
+            if (
+                message.includes("rejected") ||
+                message.includes("not present locally")
+            ) {
+                throw new Error(
+                    "Push rejected. Pull changes from the remote, resolve any conflicts, then push again."
+                );
+            }
+            if (
+                message.includes("Could not resolve host") ||
+                message.includes("failed to resolve") ||
+                message.includes("connection") ||
+                message.includes("timed out") ||
+                message.includes("Network is unreachable")
+            ) {
+                throw new NoNetworkError(message);
+            }
+            throw new Error(
+                message || `gitx push failed with exit code ${result.code}.`
+            );
+        }
     }
 
     /**
@@ -1419,6 +1531,43 @@ export class SimpleGit extends GitManager {
                 // fallback for when setting upstream branch to a branch that does not exist on the remote yet. Setting it with push instead.
                 const [remote, remoteBranchName] =
                     splitRemoteBranch(remoteBranch);
+                const currentBranch = await this.getCurrentBranch();
+                const gitxPath = this.getGitxPath();
+                if (
+                    gitxPath != undefined &&
+                    remote.length > 0 &&
+                    currentBranch != undefined &&
+                    currentBranch === remoteBranchName
+                ) {
+                    // gitx pushes the current branch under its own name, so
+                    // this only covers a same-named remote branch. Creating
+                    // the remote branch through gitx keeps the git binary out
+                    // of the first push that establishes the upstream.
+                    await this.runGitxPush(gitxPath, remote);
+                    try {
+                        await this.git.branch([
+                            "--set-upstream-to",
+                            remoteBranch,
+                        ]);
+                    } catch {
+                        // gitx updates the remote-tracking ref; when it is
+                        // still missing write the upstream configuration
+                        // directly instead of pushing again.
+                        await this.git.addConfig(
+                            `branch.${currentBranch}.remote`,
+                            remote,
+                            false,
+                            "local"
+                        );
+                        await this.git.addConfig(
+                            `branch.${currentBranch}.merge`,
+                            `refs/heads/${remoteBranchName}`,
+                            false,
+                            "local"
+                        );
+                    }
+                    return;
+                }
                 const branchInfo = await this.branchInfo();
                 await this.git.push([
                     "--set-upstream",

@@ -100,6 +100,26 @@ export class LocalStorageSettings {
         return this.app.saveLocalStorage(this.prefix + "gitPath", value);
     }
 
+    getGitxEnabled(): boolean {
+        return this.app.loadLocalStorage(this.prefix + "gitxEnabled") == "true";
+    }
+
+    setGitxEnabled(value: boolean): void {
+        return this.app.saveLocalStorage(
+            this.prefix + "gitxEnabled",
+            `${value}`
+        );
+    }
+
+    getGitxPath(): string | null {
+        return this.app.loadLocalStorage(this.prefix + "gitxPath") as
+            string | null;
+    }
+
+    setGitxPath(value: string): void {
+        return this.app.saveLocalStorage(this.prefix + "gitxPath", value);
+    }
+
     getPATHPaths(): string[] {
         return (
             (

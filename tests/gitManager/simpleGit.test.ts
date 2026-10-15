@@ -5,13 +5,31 @@ import {
     type SimpleGit as SimpleGitClient,
     type SimpleGitProgressEvent,
 } from "simple-git";
-import { describe, expect, it, vi } from "vitest";
-import { GitOperation, type GitProgress } from "../../src/types";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+    GitOperation,
+    NoNetworkError,
+    type GitProgress,
+} from "../../src/types";
 import { SimpleGit } from "../../src/gitManager/simpleGit";
+import { runGitx } from "../../src/gitManager/gitx";
 import { withCleanup } from "../helpers/cleanup";
 import { createFakePlugin, type FakePlugin } from "../helpers/createFakePlugin";
 import { createEmptyRepo, createRepoWithOrigin } from "../helpers/gitRepo";
 import { createSimpleGitTestContext } from "../helpers/simpleGit";
+
+vi.mock("../../src/gitManager/gitx", async (importOriginal) => {
+    const actual =
+        await importOriginal<typeof import("../../src/gitManager/gitx")>();
+    return {
+        ...actual,
+        runGitx: vi.fn(),
+        // Keep tests independent of the machine: resolve to the configured
+        // path or a bare command without probing default install locations.
+        resolveGitxExecutable: (configuredPath?: string | null) =>
+            configuredPath?.trim() || "gitx",
+    };
+});
 
 function createManager(
     repoPath: string,
@@ -714,6 +732,267 @@ describe("SimpleGit.push", () => {
         ).toBe("");
         expect(plugin.log).toHaveBeenCalledWith(
             "No push target found. Ignoring push of main repo and updating submodules only."
+        );
+    });
+});
+
+function configureGitx(options: {
+    path?: string | null;
+    enabled?: boolean;
+}): (plugin: FakePlugin) => void {
+    return (plugin) => {
+        plugin.localStorage = {
+            ...plugin.localStorage,
+            getGitxEnabled: () => options.enabled ?? false,
+            getGitxPath: () => options.path ?? null,
+        } as unknown as FakePlugin["localStorage"];
+    };
+}
+
+describe("SimpleGit.push with gitx", () => {
+    beforeEach(() => {
+        vi.mocked(runGitx).mockReset();
+        vi.mocked(runGitx).mockResolvedValue({
+            stdout: "",
+            stderr: "",
+            code: 0,
+            error: undefined,
+        });
+    });
+
+    it("pushes through gitx and reports the changed file count", async () => {
+        const { repo, plugin, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+
+        const result = await manager.push();
+
+        expect(result).toEqual({ status: "pushed", files: 1 });
+        expect(runGitx).toHaveBeenCalledWith(
+            "gitx",
+            ["push", "origin"],
+            expect.objectContaining({ cwd: manager.absoluteRepoPath })
+        );
+        // The transfer ran through gitx, so the remote behind the test
+        // repository has not received the commit.
+        expect(await repo.unpushedCount()).toBe(1);
+        expect(plugin.setPluginState.mock.calls).toEqual([
+            [{ operation: GitOperation.push }],
+            [{ operation: GitOperation.idle }],
+        ]);
+    });
+
+    it("returns up-to-date when there is nothing to push", async () => {
+        const { manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+
+        await expect(manager.push()).resolves.toEqual({
+            status: "up-to-date",
+        });
+        expect(runGitx).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports rejected pushes with a pull-first message", async () => {
+        vi.mocked(runGitx).mockResolvedValue({
+            stdout: "",
+            stderr: "gitx: error: push to 'origin/main' was rejected: the remote has commits not present locally; run 'gitx sync' first",
+            code: 1,
+            error: undefined,
+        });
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+
+        await expect(manager.push()).rejects.toThrow(
+            "Push rejected. Pull changes from the remote, resolve any conflicts, then push again."
+        );
+    });
+
+    it("maps network failures to NoNetworkError", async () => {
+        vi.mocked(runGitx).mockResolvedValue({
+            stdout: "",
+            stderr: "gitx: error: failed to resolve address for github.com: nodename nor servname provided",
+            code: 1,
+            error: undefined,
+        });
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+
+        await expect(manager.push()).rejects.toBeInstanceOf(NoNetworkError);
+    });
+
+    it("rejects renamed push targets instead of pushing the wrong branch", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.git.checkoutLocalBranch("dev");
+        await repo.raw(["branch", "--set-upstream-to=origin/main", "dev"]);
+        await repo.git.addConfig("push.default", "upstream");
+        await repo.writeAndCommit("dev.md", "dev\n", "dev commit");
+
+        await expect(manager.push()).rejects.toThrow(
+            "Cannot push with gitx: the push target 'origin/main' differs from the current branch 'dev'. gitx pushes to the branch with the same name."
+        );
+        expect(runGitx).not.toHaveBeenCalled();
+    });
+
+    it("pushes through the single remote when no push target is configured", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.raw(["branch", "--unset-upstream"]);
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+
+        expect(
+            await repo.raw([
+                "for-each-ref",
+                "--format=%(push)",
+                "refs/heads/main",
+            ])
+        ).toBe("");
+
+        const result = await manager.push();
+
+        expect(result).toEqual({ status: "pushed", files: null });
+        expect(runGitx).toHaveBeenCalledWith(
+            "gitx",
+            ["push", "origin"],
+            expect.objectContaining({ cwd: manager.absoluteRepoPath })
+        );
+    });
+
+    it("rejects the push without a push target when several remotes exist", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.raw(["branch", "--unset-upstream"]);
+        await repo.git.addRemote("other", repo.remotePath);
+
+        await expect(manager.push()).rejects.toThrow(
+            "Cannot push with gitx: no push target could be determined for branch 'main'."
+        );
+        expect(runGitx).not.toHaveBeenCalled();
+    });
+
+    it("still pushes through gitx when no push target exists and submodule updates are enabled", async () => {
+        const { repo, plugin, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.raw(["branch", "--unset-upstream"]);
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+        plugin.settings.updateSubmodules = true;
+
+        const result = await manager.push();
+
+        expect(result).toEqual({ status: "pushed", files: null });
+        expect(runGitx).toHaveBeenCalledWith(
+            "gitx",
+            ["push", "origin"],
+            expect.objectContaining({ cwd: manager.absoluteRepoPath })
+        );
+    });
+
+    it("creates the remote branch through gitx when setting a missing upstream", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.raw(["branch", "--unset-upstream"]);
+        await repo.raw(["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        await manager.updateUpstreamBranch("origin/main");
+
+        expect(runGitx).toHaveBeenCalledWith(
+            "gitx",
+            ["push", "origin"],
+            expect.objectContaining({ cwd: manager.absoluteRepoPath })
+        );
+        // The mocked gitx does not create the remote-tracking ref, so the
+        // upstream is written directly as a fallback.
+        expect(await repo.raw(["config", "--get", "branch.main.remote"])).toBe(
+            "origin"
+        );
+        expect(await repo.raw(["config", "--get", "branch.main.merge"])).toBe(
+            "refs/heads/main"
+        );
+    });
+
+    it("keeps using the Git binary when the upstream branch has a different name", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ path: "gitx", enabled: true }),
+            })
+        );
+        await repo.raw(["branch", "--unset-upstream"]);
+        await repo.raw(["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        await manager.updateUpstreamBranch("origin/other");
+
+        expect(runGitx).not.toHaveBeenCalled();
+        expect(await repo.raw(["config", "--get", "branch.main.remote"])).toBe(
+            "origin"
+        );
+        expect(await repo.raw(["config", "--get", "branch.main.merge"])).toBe(
+            "refs/heads/other"
+        );
+    });
+
+    it("falls back to the Git binary when gitx is disabled", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({
+                    path: "gitx",
+                    enabled: false,
+                }),
+            })
+        );
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+
+        const result = await manager.push();
+
+        expect(result).toEqual({ status: "pushed", files: 1 });
+        expect(runGitx).not.toHaveBeenCalled();
+        // The push ran through the Git binary, so the remote behind the test
+        // repository received the commit.
+        expect(await repo.unpushedCount()).toBe(0);
+    });
+
+    it("uses the plain 'gitx' command when no executable path is set", async () => {
+        const { repo, manager } = withCleanup(
+            await createSimpleGitTestContext({
+                configurePlugin: configureGitx({ enabled: true }),
+            })
+        );
+        await repo.appendAndCommit("note.md", "local\n", "local commit");
+
+        await manager.push();
+
+        expect(runGitx).toHaveBeenCalledWith(
+            "gitx",
+            ["push", "origin"],
+            expect.objectContaining({ cwd: manager.absoluteRepoPath })
         );
     });
 });

@@ -39,6 +39,8 @@ function configurePlugin(
     plugin.localStorage = {
         ...plugin.localStorage,
         getGitPath: () => null,
+        getGitxEnabled: () => false,
+        getGitxPath: () => null,
         getPATHPaths: () => [],
         // Supplying an askpass command keeps setGitInstance focused on client
         // initialization instead of starting the plugin's long-lived watcher.

@@ -901,3 +901,31 @@ div:hover > .git-gutter-marker.git-changedelete {
 .is-mobile .git-conflict-actions-widget .nav-action-button {
     flex: 1 1 auto;
 }
+
+.obsidian-git-gitx-status {
+    cursor: pointer;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+}
+
+.obsidian-git-gitx-status-dot {
+    display: inline-block;
+    width: 0.6em;
+    height: 0.6em;
+    margin-right: 6px;
+    border-radius: 50%;
+    background-color: var(--text-muted);
+    vertical-align: middle;
+}
+
+.obsidian-git-gitx-status-dot.mod-ok {
+    background-color: var(--color-green);
+}
+
+.obsidian-git-gitx-status-dot.mod-error {
+    background-color: var(--color-red);
+}
+
+.obsidian-git-gitx-copy {
+    font-size: var(--font-ui-smaller);
+}
